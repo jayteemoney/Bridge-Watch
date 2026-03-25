@@ -5,6 +5,7 @@ import websocket from "@fastify/websocket";
 import { config } from "./config/index.js";
 import { logger } from "./utils/logger.js";
 import { registerRoutes } from "./api/routes/index.js";
+import { startBridgeVerificationJob } from "./jobs/verification.job.js";
 
 export async function buildServer() {
   const server = Fastify({
@@ -25,7 +26,7 @@ export async function buildServer() {
   await server.register(websocket);
 
   // Register routes
-  await registerRoutes(server);
+  await registerRoutes(server as any);
 
   // Health check
   server.get("/health", async () => {
@@ -43,10 +44,15 @@ async function start() {
     server.log.info(
       `Stellar Bridge Watch API running on port ${config.PORT}`
     );
+
+    // Initialize background jobs
+    startBridgeVerificationJob();
   } catch (err) {
     server.log.error(err);
     process.exit(1);
   }
 }
 
-start();
+if (process.env.NODE_ENV !== "test") {
+  start();
+}

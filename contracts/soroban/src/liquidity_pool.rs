@@ -1,0 +1,821 @@
+//! Liquidity Pool Monitor Contract Module
+//!
+//! Tracks liquidity pool states across Stellar DEXs (SDEX, AMM pools),
+//! calculates historical metrics, and provides on-chain analytics for
+//! liquidity depth, impermanent loss, and pool performance.
+//!
+//! ## Features
+//! - Ring-buffer based time-series storage for gas-efficient historical data
+//! - Time-bucketed snapshots (hourly, daily) for efficient queries
+//! - Impermanent loss calculation for LP positions
+//! - Volume tracking and fee accumulation analytics
+//! - Aggregated statistics: 24h volume, 7d average depth, 30d performance
+//! - Event emissions for significant liquidity changes
+//! - Public read access with permissioned write access
+//!
+//! ## Supported Asset Pairs (Phase 1)
+//! - USDC/XLM, EURC/XLM, PYUSD/XLM, FOBXX/USDC
+
+use soroban_sdk::{contracttype, Env, String, Vec};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of snapshots stored per pool in the ring buffer.
+/// At one snapshot per hour, 720 entries ≈ 30 days of data.
+pub const MAX_SNAPSHOTS: u32 = 720;
+
+/// Maximum number of daily buckets stored per pool.
+/// 90 entries = 90 days of aggregated daily data.
+pub const MAX_DAILY_BUCKETS: u32 = 90;
+
+/// Duration constants (in seconds)
+pub const HOUR_SECS: u64 = 3_600;
+pub const DAY_SECS: u64 = 86_400;
+pub const WEEK_SECS: u64 = 604_800;
+pub const MONTH_SECS: u64 = 2_592_000; // 30 days
+
+/// Threshold for significant liquidity change events (10% = 1000 basis points)
+pub const SIGNIFICANT_CHANGE_BPS: u32 = 1_000;
+
+/// Precision multiplier for fixed-point math (7 decimals like Stellar)
+pub const PRECISION: i128 = 10_000_000; // 1e7
+
+// ---------------------------------------------------------------------------
+// Pool types
+// ---------------------------------------------------------------------------
+
+/// Represents the type of DEX pool being monitored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PoolType {
+    /// Stellar Decentralized Exchange (order book)
+    Sdex,
+    /// Automated Market Maker (constant-product)
+    Amm,
+}
+
+// ---------------------------------------------------------------------------
+// Data structures
+// ---------------------------------------------------------------------------
+
+/// A point-in-time snapshot of a liquidity pool's state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolSnapshot {
+    /// The identifier for the pool (e.g. "USDC_XLM")
+    pub pool_id: String,
+    /// Reserve amount of asset A (base asset), scaled by PRECISION
+    pub reserve_a: i128,
+    /// Reserve amount of asset B (quote asset), scaled by PRECISION
+    pub reserve_b: i128,
+    /// Total LP shares outstanding
+    pub total_shares: i128,
+    /// Current price of A in terms of B, scaled by PRECISION
+    pub price: i128,
+    /// Trading volume since last snapshot, scaled by PRECISION
+    pub volume: i128,
+    /// Fees collected since last snapshot, scaled by PRECISION
+    pub fees_collected: i128,
+    /// Pool type (SDEX or AMM)
+    pub pool_type: PoolType,
+    /// Ledger timestamp when this snapshot was recorded
+    pub timestamp: u64,
+}
+
+/// Aggregated daily bucket for efficient historical queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DailyBucket {
+    /// Start-of-day timestamp (UTC midnight)
+    pub day_timestamp: u64,
+    /// Opening price of the day, scaled by PRECISION
+    pub open_price: i128,
+    /// Highest price of the day, scaled by PRECISION
+    pub high_price: i128,
+    /// Lowest price of the day, scaled by PRECISION
+    pub low_price: i128,
+    /// Closing price of the day, scaled by PRECISION
+    pub close_price: i128,
+    /// Total trading volume for the day, scaled by PRECISION
+    pub total_volume: i128,
+    /// Total fees collected for the day, scaled by PRECISION
+    pub total_fees: i128,
+    /// Average reserve A across snapshots, scaled by PRECISION
+    pub avg_reserve_a: i128,
+    /// Average reserve B across snapshots, scaled by PRECISION
+    pub avg_reserve_b: i128,
+    /// Number of snapshots aggregated into this bucket
+    pub snapshot_count: u32,
+}
+
+/// Computed metrics for a pool over a configurable time window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolMetrics {
+    /// Pool identifier
+    pub pool_id: String,
+    /// Total trading volume over the window, scaled by PRECISION
+    pub total_volume: i128,
+    /// Average liquidity depth (geometric mean of reserves), scaled by PRECISION
+    pub avg_depth: i128,
+    /// Price change (percentage × PRECISION; positive = appreciation)
+    pub price_change: i128,
+    /// Total fees collected over the window, scaled by PRECISION
+    pub total_fees: i128,
+    /// Fee APR estimate (annualized, × PRECISION)
+    pub fee_apr: i128,
+    /// Number of data points in the calculation
+    pub data_points: u32,
+    /// Window start timestamp
+    pub window_start: u64,
+    /// Window end timestamp
+    pub window_end: u64,
+}
+
+/// Result of an impermanent loss calculation for an LP position.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpermanentLossResult {
+    /// Pool identifier
+    pub pool_id: String,
+    /// IL as a percentage × PRECISION (always non-negative; 0 = no loss)
+    pub il_percentage: i128,
+    /// Value of LP position now, scaled by PRECISION
+    pub current_value: i128,
+    /// Value if tokens were simply held, scaled by PRECISION
+    pub hodl_value: i128,
+    /// Net loss in absolute terms (hodl_value − current_value), can be negative
+    pub net_loss: i128,
+    /// Entry price at which the position was opened, scaled by PRECISION
+    pub entry_price: i128,
+    /// Current price, scaled by PRECISION
+    pub current_price: i128,
+}
+
+/// Liquidity depth information at the current moment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityDepth {
+    /// Pool identifier
+    pub pool_id: String,
+    /// Reserve A (base asset), scaled by PRECISION
+    pub reserve_a: i128,
+    /// Reserve B (quote asset), scaled by PRECISION
+    pub reserve_b: i128,
+    /// Total value locked denominated in asset B, scaled by PRECISION
+    pub total_value_locked: i128,
+    /// Depth score (0–100, higher = deeper liquidity)
+    pub depth_score: u32,
+    /// Timestamp of the latest snapshot used
+    pub timestamp: u64,
+}
+
+/// Ring buffer metadata for a pool's snapshot history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RingBufferMeta {
+    /// Current write index (next slot to write)
+    pub head: u32,
+    /// Total number of entries written (may exceed capacity; actual count = min(count, capacity))
+    pub count: u32,
+    /// Maximum capacity of the ring buffer
+    pub capacity: u32,
+}
+
+/// Ring buffer metadata for daily buckets.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DailyRingMeta {
+    pub head: u32,
+    pub count: u32,
+    pub capacity: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+
+/// Storage keys used by the liquidity pool monitor.
+///
+/// Keys are designed to minimise storage footprint while enabling efficient
+/// lookups by pool ID and index.
+#[contracttype]
+pub enum LiquidityKey {
+    /// Ring buffer metadata for a pool's snapshot history
+    PoolRingMeta(String),
+    /// Individual snapshot entry: (pool_id, ring_index)
+    PoolSnapshot(String, u32),
+    /// Daily bucket ring metadata
+    DailyRingMeta(String),
+    /// Individual daily bucket: (pool_id, ring_index)
+    DailyBucket(String, u32),
+    /// Set of all registered pool IDs
+    RegisteredPools,
+}
+
+// ---------------------------------------------------------------------------
+// Core logic (pure functions operating on Env)
+// ---------------------------------------------------------------------------
+
+/// Record a new pool state snapshot.
+///
+/// Writes the snapshot into the pool's ring buffer, updates (or creates) the
+/// relevant daily bucket, and emits events when significant liquidity changes
+/// are detected.
+///
+/// # Panics
+/// Caller must have already verified admin authorisation before invoking this.
+pub fn record_pool_state(
+    env: &Env,
+    pool_id: String,
+    reserve_a: i128,
+    reserve_b: i128,
+    total_shares: i128,
+    volume: i128,
+    fees: i128,
+    pool_type: PoolType,
+) {
+    let timestamp = env.ledger().timestamp();
+    let price = if reserve_a > 0 {
+        (reserve_b * PRECISION) / reserve_a
+    } else {
+        0
+    };
+
+    let snapshot = PoolSnapshot {
+        pool_id: pool_id.clone(),
+        reserve_a,
+        reserve_b,
+        total_shares,
+        price,
+        volume,
+        fees_collected: fees,
+        pool_type,
+        timestamp,
+    };
+
+    // --- Write to snapshot ring buffer ---
+    let mut meta: RingBufferMeta = env
+        .storage()
+        .persistent()
+        .get(&LiquidityKey::PoolRingMeta(pool_id.clone()))
+        .unwrap_or(RingBufferMeta {
+            head: 0,
+            count: 0,
+            capacity: MAX_SNAPSHOTS,
+        });
+
+    let write_idx = meta.head;
+    env.storage().persistent().set(
+        &LiquidityKey::PoolSnapshot(pool_id.clone(), write_idx),
+        &snapshot,
+    );
+
+    meta.head = (meta.head + 1) % meta.capacity;
+    meta.count += 1;
+    env.storage()
+        .persistent()
+        .set(&LiquidityKey::PoolRingMeta(pool_id.clone()), &meta);
+
+    // --- Update daily bucket ---
+    update_daily_bucket(env, &pool_id, &snapshot);
+
+    // --- Detect significant liquidity changes ---
+    if meta.count > 1 {
+        let prev_idx = if write_idx == 0 {
+            meta.capacity - 1
+        } else {
+            write_idx - 1
+        };
+        let prev: Option<PoolSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&LiquidityKey::PoolSnapshot(pool_id.clone(), prev_idx));
+
+        if let Some(prev_snap) = prev {
+            check_significant_change(env, &prev_snap, &snapshot);
+        }
+    }
+
+    // --- Ensure pool is registered ---
+    ensure_pool_registered(env, &pool_id);
+
+    // Emit a standard snapshot event
+    env.events()
+        .publish((pool_id, soroban_sdk::symbol_short!("snapshot")), timestamp);
+}
+
+/// Calculate aggregated pool metrics over a specified time window.
+///
+/// Scans the ring buffer for snapshots within `[now − window_secs, now]` and
+/// computes volume, average depth, price change, fees, and an annualised fee APR.
+pub fn calculate_pool_metrics(env: &Env, pool_id: String, window_secs: u64) -> PoolMetrics {
+    let now = env.ledger().timestamp();
+    let window_start = if now > window_secs {
+        now - window_secs
+    } else {
+        0
+    };
+
+    let snapshots = get_snapshots_in_window(env, &pool_id, window_start, now);
+
+    let data_points = snapshots.len();
+    if data_points == 0 {
+        return PoolMetrics {
+            pool_id,
+            total_volume: 0,
+            avg_depth: 0,
+            price_change: 0,
+            total_fees: 0,
+            fee_apr: 0,
+            data_points: 0,
+            window_start,
+            window_end: now,
+        };
+    }
+
+    let mut total_volume: i128 = 0;
+    let mut total_fees: i128 = 0;
+    let mut depth_sum: i128 = 0;
+
+    for i in 0..data_points {
+        let snap = snapshots.get(i).unwrap();
+        total_volume += snap.volume;
+        total_fees += snap.fees_collected;
+        // depth ≈ sqrt(reserve_a * reserve_b) approximated as (a + b) / 2
+        depth_sum += (snap.reserve_a + snap.reserve_b) / 2;
+    }
+
+    let avg_depth = depth_sum / data_points as i128;
+
+    let first = snapshots.get(0).unwrap();
+    let last = snapshots.get(data_points - 1).unwrap();
+
+    let price_change = if first.price > 0 {
+        ((last.price - first.price) * PRECISION) / first.price
+    } else {
+        0
+    };
+
+    // Annualised fee APR: (total_fees / avg_depth) * (365 days / window days)
+    let fee_apr = if avg_depth > 0 && window_secs > 0 {
+        let year_secs: i128 = 365 * DAY_SECS as i128;
+        (total_fees * PRECISION * year_secs) / (avg_depth * window_secs as i128)
+    } else {
+        0
+    };
+
+    PoolMetrics {
+        pool_id,
+        total_volume,
+        avg_depth,
+        price_change,
+        total_fees,
+        fee_apr,
+        data_points,
+        window_start,
+        window_end: now,
+    }
+}
+
+/// Retrieve historical pool snapshots within a time range.
+///
+/// Returns a `Vec<PoolSnapshot>` ordered oldest-first.
+pub fn get_pool_history(
+    env: &Env,
+    pool_id: String,
+    from_timestamp: u64,
+    to_timestamp: u64,
+) -> Vec<PoolSnapshot> {
+    get_snapshots_in_window(env, &pool_id, from_timestamp, to_timestamp)
+}
+
+/// Calculate impermanent loss for a position entered at `entry_price`.
+///
+/// Uses the standard IL formula:
+/// ```text
+/// IL = 2 * sqrt(price_ratio) / (1 + price_ratio) − 1
+/// ```
+/// We approximate `sqrt` via the integer Newton's method (Babylonian).
+pub fn calculate_impermanent_loss(
+    env: &Env,
+    pool_id: String,
+    entry_price: i128,
+    initial_value: i128,
+) -> ImpermanentLossResult {
+    let latest = get_latest_snapshot(env, &pool_id);
+    let current_price = match latest {
+        Some(ref s) => s.price,
+        None => 0,
+    };
+
+    if entry_price <= 0 || current_price <= 0 {
+        return ImpermanentLossResult {
+            pool_id,
+            il_percentage: 0,
+            current_value: initial_value,
+            hodl_value: initial_value,
+            net_loss: 0,
+            entry_price,
+            current_price,
+        };
+    }
+
+    // price_ratio = current_price / entry_price  (scaled by PRECISION)
+    let price_ratio = (current_price * PRECISION) / entry_price;
+
+    // sqrt(price_ratio) scaled by PRECISION
+    let sqrt_ratio = isqrt(price_ratio * PRECISION); // sqrt(x * P) when x is already scaled by P
+
+    // IL = 2 * sqrt(r) / (1 + r) − 1  (all in PRECISION units)
+    let numerator = 2 * sqrt_ratio;
+    let denominator = PRECISION + price_ratio;
+
+    let il_factor = if denominator > 0 {
+        PRECISION - (numerator * PRECISION) / denominator
+    } else {
+        0
+    };
+
+    // Ensure non-negative
+    let il_percentage = if il_factor > 0 { il_factor } else { 0 };
+
+    // hodl_value: half stayed asset A (appreciated by price_ratio), half stayed asset B
+    let hodl_value = (initial_value * (PRECISION + price_ratio)) / (2 * PRECISION);
+
+    // LP value: initial_value adjusted by IL
+    let current_value = (hodl_value * (PRECISION - il_percentage)) / PRECISION;
+
+    let net_loss = hodl_value - current_value;
+
+    ImpermanentLossResult {
+        pool_id,
+        il_percentage,
+        current_value,
+        hodl_value,
+        net_loss,
+        entry_price,
+        current_price,
+    }
+}
+
+/// Get current liquidity depth information for a pool.
+///
+/// Computes a depth score (0–100) based on reserve sizes relative to a
+/// baseline of 1 000 000 units (scaled by PRECISION).
+pub fn get_liquidity_depth(env: &Env, pool_id: String) -> LiquidityDepth {
+    let latest = get_latest_snapshot(env, &pool_id);
+
+    match latest {
+        Some(snap) => {
+            let total_value_locked = snap.reserve_a * snap.price / PRECISION + snap.reserve_b;
+
+            // depth_score: logarithmic scale capped at 100
+            let baseline: i128 = 1_000_000 * PRECISION;
+            let score = if total_value_locked >= baseline {
+                100u32
+            } else if total_value_locked <= 0 {
+                0u32
+            } else {
+                ((total_value_locked * 100) / baseline) as u32
+            };
+
+            LiquidityDepth {
+                pool_id,
+                reserve_a: snap.reserve_a,
+                reserve_b: snap.reserve_b,
+                total_value_locked,
+                depth_score: score,
+                timestamp: snap.timestamp,
+            }
+        }
+        None => LiquidityDepth {
+            pool_id,
+            reserve_a: 0,
+            reserve_b: 0,
+            total_value_locked: 0,
+            depth_score: 0,
+            timestamp: 0,
+        },
+    }
+}
+
+/// Get daily aggregated buckets for a pool within a time range.
+pub fn get_daily_history(
+    env: &Env,
+    pool_id: String,
+    from_timestamp: u64,
+    to_timestamp: u64,
+) -> Vec<DailyBucket> {
+    let meta: DailyRingMeta = env
+        .storage()
+        .persistent()
+        .get(&LiquidityKey::DailyRingMeta(pool_id.clone()))
+        .unwrap_or(DailyRingMeta {
+            head: 0,
+            count: 0,
+            capacity: MAX_DAILY_BUCKETS,
+        });
+
+    let actual_count = if meta.count > meta.capacity {
+        meta.capacity
+    } else {
+        meta.count
+    };
+
+    let mut result: Vec<DailyBucket> = Vec::new(env);
+
+    if actual_count == 0 {
+        return result;
+    }
+
+    // Walk the ring buffer from oldest to newest
+    let start_idx = if meta.count > meta.capacity {
+        meta.head // oldest entry is at head when buffer has wrapped
+    } else {
+        0
+    };
+
+    for i in 0..actual_count {
+        let idx = (start_idx + i) % meta.capacity;
+        let bucket: Option<DailyBucket> = env
+            .storage()
+            .persistent()
+            .get(&LiquidityKey::DailyBucket(pool_id.clone(), idx));
+
+        if let Some(b) = bucket {
+            if b.day_timestamp >= from_timestamp && b.day_timestamp <= to_timestamp {
+                result.push_back(b);
+            }
+        }
+    }
+
+    result
+}
+
+/// Get all registered pool IDs.
+pub fn get_registered_pools(env: &Env) -> Vec<String> {
+    env.storage()
+        .persistent()
+        .get(&LiquidityKey::RegisteredPools)
+        .unwrap_or(Vec::new(env))
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Retrieve the most recent snapshot for a pool (if any).
+fn get_latest_snapshot(env: &Env, pool_id: &String) -> Option<PoolSnapshot> {
+    let meta: Option<RingBufferMeta> = env
+        .storage()
+        .persistent()
+        .get(&LiquidityKey::PoolRingMeta(pool_id.clone()));
+
+    match meta {
+        Some(m) if m.count > 0 => {
+            let latest_idx = if m.head == 0 {
+                m.capacity - 1
+            } else {
+                m.head - 1
+            };
+            env.storage()
+                .persistent()
+                .get(&LiquidityKey::PoolSnapshot(pool_id.clone(), latest_idx))
+        }
+        _ => None,
+    }
+}
+
+/// Collect all snapshots in a time window, ordered oldest-first.
+fn get_snapshots_in_window(
+    env: &Env,
+    pool_id: &String,
+    from: u64,
+    to: u64,
+) -> Vec<PoolSnapshot> {
+    let meta: RingBufferMeta = env
+        .storage()
+        .persistent()
+        .get(&LiquidityKey::PoolRingMeta(pool_id.clone()))
+        .unwrap_or(RingBufferMeta {
+            head: 0,
+            count: 0,
+            capacity: MAX_SNAPSHOTS,
+        });
+
+    let actual_count = if meta.count > meta.capacity {
+        meta.capacity
+    } else {
+        meta.count
+    };
+
+    let mut result: Vec<PoolSnapshot> = Vec::new(env);
+
+    if actual_count == 0 {
+        return result;
+    }
+
+    // Walk from oldest to newest
+    let start_idx = if meta.count > meta.capacity {
+        meta.head
+    } else {
+        0
+    };
+
+    for i in 0..actual_count {
+        let idx = (start_idx + i) % meta.capacity;
+        let snap: Option<PoolSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&LiquidityKey::PoolSnapshot(pool_id.clone(), idx));
+
+        if let Some(s) = snap {
+            if s.timestamp >= from && s.timestamp <= to {
+                result.push_back(s);
+            }
+        }
+    }
+
+    result
+}
+
+/// Update (or create) the daily bucket for the day containing this snapshot.
+fn update_daily_bucket(env: &Env, pool_id: &String, snapshot: &PoolSnapshot) {
+    let day_ts = (snapshot.timestamp / DAY_SECS) * DAY_SECS;
+
+    let mut meta: DailyRingMeta = env
+        .storage()
+        .persistent()
+        .get(&LiquidityKey::DailyRingMeta(pool_id.clone()))
+        .unwrap_or(DailyRingMeta {
+            head: 0,
+            count: 0,
+            capacity: MAX_DAILY_BUCKETS,
+        });
+
+    // Check if the most recent bucket covers the same day
+    let existing_idx = if meta.count > 0 {
+        let last_idx = if meta.head == 0 {
+            meta.capacity - 1
+        } else {
+            meta.head - 1
+        };
+        let existing: Option<DailyBucket> = env
+            .storage()
+            .persistent()
+            .get(&LiquidityKey::DailyBucket(pool_id.clone(), last_idx));
+
+        match existing {
+            Some(ref b) if b.day_timestamp == day_ts => Some((last_idx, b.clone())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    match existing_idx {
+        Some((idx, mut bucket)) => {
+            // Update existing bucket for today
+            if snapshot.price > bucket.high_price {
+                bucket.high_price = snapshot.price;
+            }
+            if snapshot.price < bucket.low_price {
+                bucket.low_price = snapshot.price;
+            }
+            bucket.close_price = snapshot.price;
+            bucket.total_volume += snapshot.volume;
+            bucket.total_fees += snapshot.fees_collected;
+            // Running average of reserves
+            let n = bucket.snapshot_count as i128;
+            bucket.avg_reserve_a = (bucket.avg_reserve_a * n + snapshot.reserve_a) / (n + 1);
+            bucket.avg_reserve_b = (bucket.avg_reserve_b * n + snapshot.reserve_b) / (n + 1);
+            bucket.snapshot_count += 1;
+
+            env.storage()
+                .persistent()
+                .set(&LiquidityKey::DailyBucket(pool_id.clone(), idx), &bucket);
+        }
+        None => {
+            // Create new daily bucket
+            let new_bucket = DailyBucket {
+                day_timestamp: day_ts,
+                open_price: snapshot.price,
+                high_price: snapshot.price,
+                low_price: snapshot.price,
+                close_price: snapshot.price,
+                total_volume: snapshot.volume,
+                total_fees: snapshot.fees_collected,
+                avg_reserve_a: snapshot.reserve_a,
+                avg_reserve_b: snapshot.reserve_b,
+                snapshot_count: 1,
+            };
+
+            let write_idx = meta.head;
+            env.storage().persistent().set(
+                &LiquidityKey::DailyBucket(pool_id.clone(), write_idx),
+                &new_bucket,
+            );
+            meta.head = (meta.head + 1) % meta.capacity;
+            meta.count += 1;
+            env.storage()
+                .persistent()
+                .set(&LiquidityKey::DailyRingMeta(pool_id.clone()), &meta);
+        }
+    }
+}
+
+/// Emit an event if the liquidity change exceeds `SIGNIFICANT_CHANGE_BPS`.
+fn check_significant_change(env: &Env, prev: &PoolSnapshot, curr: &PoolSnapshot) {
+    let prev_depth = prev.reserve_a + prev.reserve_b;
+    if prev_depth == 0 {
+        return;
+    }
+    let curr_depth = curr.reserve_a + curr.reserve_b;
+    let change_bps = ((curr_depth - prev_depth).abs() * 10_000) / prev_depth;
+
+    if change_bps >= SIGNIFICANT_CHANGE_BPS as i128 {
+        env.events().publish(
+            (
+                curr.pool_id.clone(),
+                soroban_sdk::symbol_short!("liq_chg"),
+            ),
+            (change_bps, curr.timestamp),
+        );
+    }
+}
+
+/// Ensure the pool ID is in the registered-pools list.
+fn ensure_pool_registered(env: &Env, pool_id: &String) {
+    let mut pools: Vec<String> = env
+        .storage()
+        .persistent()
+        .get(&LiquidityKey::RegisteredPools)
+        .unwrap_or(Vec::new(env));
+
+    // Linear scan (acceptable for small pool count in Phase 1)
+    let mut found = false;
+    for i in 0..pools.len() {
+        if pools.get(i).unwrap() == pool_id.clone() {
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        pools.push_back(pool_id.clone());
+        env.storage()
+            .persistent()
+            .set(&LiquidityKey::RegisteredPools, &pools);
+    }
+}
+
+/// Integer square root via Newton's method (Babylonian).
+///
+/// Returns `floor(sqrt(n))` for `n >= 0`.
+/// Used for impermanent loss calculation to avoid floating-point.
+fn isqrt(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    if n == 1 {
+        return 1;
+    }
+
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_isqrt_values() {
+        assert_eq!(isqrt(0), 0);
+        assert_eq!(isqrt(1), 1);
+        assert_eq!(isqrt(4), 2);
+        assert_eq!(isqrt(9), 3);
+        assert_eq!(isqrt(10), 3);
+        assert_eq!(isqrt(100), 10);
+        assert_eq!(isqrt(100_000_000_000_000), 10_000_000); // sqrt(1e14) = 1e7
+    }
+
+    #[test]
+    fn test_isqrt_precision_scale() {
+        // sqrt(PRECISION * PRECISION) == PRECISION
+        let val = PRECISION * PRECISION;
+        assert_eq!(isqrt(val), PRECISION);
+    }
+}

@@ -35,6 +35,12 @@ const envSchema = z.object({
 
   // Ethereum
   ETHEREUM_RPC_URL: z.string().url().optional(),
+  ETHEREUM_RPC_WS_URL: z.string().url().optional(),
+  RPC_PROVIDER_TYPE: z.enum(["http", "ws"]).default("http"),
+  USDC_BRIDGE_ADDRESS: z.string().optional(),
+  EURC_BRIDGE_ADDRESS: z.string().optional(),
+  USDC_TOKEN_ADDRESS: z.string().optional(),
+  EURC_TOKEN_ADDRESS: z.string().optional(),
 
   // External APIs
   CIRCLE_API_KEY: z.string().optional(),
@@ -52,10 +58,31 @@ const envSchema = z.object({
 
   // Alert Thresholds
   PRICE_DEVIATION_THRESHOLD: z.coerce.number().default(0.02),
-  BRIDGE_SUPPLY_MISMATCH_THRESHOLD: z.coerce.number().default(0.01),
+  BRIDGE_SUPPLY_MISMATCH_THRESHOLD: z.coerce.number().default(0.1),
+
+  // Verification & Retries
+  RETRY_MAX: z.coerce.number().default(3),
+  BRIDGE_VERIFICATION_INTERVAL_MS: z.coerce.number().default(300000),
+
+  // Price Aggregation
+  HORIZON_TIMEOUT_MS: z.coerce.number().default(500),
+  REDIS_CACHE_TTL_SEC: z.coerce.number().default(30),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;
+
+export interface StellarAssetConfig {
+  code: string;
+  issuer: string;
+}
+
+export const SUPPORTED_ASSETS: StellarAssetConfig[] = [
+  { code: "XLM", issuer: "native" },
+  { code: "USDC", issuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+  { code: "PYUSD", issuer: "GBHZAE5IQTOPQZ66TFWZYIYCHQ6T3GMWHDKFEXAKYWJ2BHLZQ227KRYE" },
+  { code: "EURC", issuer: "GDQOE23CFSUMSVZZ4YRVXGW7PCFNIAHLMRAHDE4Z32DIBQGH4KZZK2KZ" },
+  { code: "FOBXX", issuer: "GBX7VUT2UTUKO2H76J26D7QYWNFW6C2NYN6K74Y3K43HGBXYZ" },
+];
 
 const parsed = envSchema.safeParse(process.env);
 
