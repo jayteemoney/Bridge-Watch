@@ -7,7 +7,9 @@ pub mod governance;
 pub mod liquidity_pool;
 #[cfg(test)]
 pub mod insurance_pool;
+#[cfg(test)]
 pub mod rate_limiter;
+#[cfg(test)]
 pub mod asset_registry;
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
@@ -25,6 +27,8 @@ pub struct AssetHealth {
     pub liquidity_score: u32,
     pub price_stability_score: u32,
     pub bridge_uptime_score: u32,
+    pub paused: bool,
+    pub active: bool,
     pub timestamp: u64,
 }
 
@@ -202,6 +206,8 @@ impl BridgeWatchContract {
         bridge_uptime_score: u32,
     ) {
         Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
+        let status = Self::load_asset_health(&env, &asset_code);
+        Self::assert_asset_accepting_submissions(&status);
 
         let record = AssetHealth {
             asset_code: asset_code.clone(),
@@ -209,6 +215,8 @@ impl BridgeWatchContract {
             liquidity_score,
             price_stability_score,
             bridge_uptime_score,
+            paused: status.paused,
+            active: status.active,
             timestamp: env.ledger().timestamp(),
         };
 
@@ -232,12 +240,17 @@ impl BridgeWatchContract {
         let timestamp = env.ledger().timestamp();
 
         for item in records.iter() {
+            let status = Self::load_asset_health(&env, &item.asset_code);
+            Self::assert_asset_accepting_submissions(&status);
+
             let record = AssetHealth {
                 asset_code: item.asset_code.clone(),
                 health_score: item.health_score,
                 liquidity_score: item.liquidity_score,
                 price_stability_score: item.price_stability_score,
                 bridge_uptime_score: item.bridge_uptime_score,
+                paused: status.paused,
+                active: status.active,
                 timestamp,
             };
 
@@ -264,6 +277,8 @@ impl BridgeWatchContract {
         source: String,
     ) {
         Self::check_permission(&env, &caller, AdminRole::PriceSubmitter);
+        let status = Self::load_asset_health(&env, &asset_code);
+        Self::assert_asset_accepting_submissions(&status);
 
         let record = PriceRecord {
             asset_code: asset_code.clone(),
@@ -304,18 +319,116 @@ impl BridgeWatchContract {
             .get(&DataKey::MonitoredAssets)
             .unwrap();
 
-        assets.push_back(asset_code);
+        for existing in assets.iter() {
+            if existing == asset_code {
+                panic!("asset is already registered");
+            }
+        }
+
+        let status = AssetHealth {
+            asset_code: asset_code.clone(),
+            health_score: 0,
+            liquidity_score: 0,
+            price_stability_score: 0,
+            bridge_uptime_score: 0,
+            paused: false,
+            active: true,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+
+        assets.push_back(asset_code.clone());
         env.storage()
             .instance()
             .set(&DataKey::MonitoredAssets, &assets);
+
+        env.events()
+            .publish((symbol_short!("asset_reg"), asset_code), true);
+    }
+
+    /// Temporarily pause monitoring for an asset.
+    ///
+    /// `caller` must be the contract admin, a `SuperAdmin`, or an
+    /// `AssetManager`.
+    pub fn pause_asset(env: Env, caller: Address, asset_code: String) {
+        Self::check_permission(&env, &caller, AdminRole::AssetManager);
+        let mut status = Self::load_asset_health(&env, &asset_code);
+        if !status.active {
+            panic!("cannot pause a deregistered asset");
+        }
+        status.paused = true;
+        status.timestamp = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+        env.events()
+            .publish((symbol_short!("asset_pau"), asset_code), true);
+    }
+
+    /// Resume monitoring for a paused asset.
+    ///
+    /// `caller` must be the contract admin, a `SuperAdmin`, or an
+    /// `AssetManager`.
+    pub fn unpause_asset(env: Env, caller: Address, asset_code: String) {
+        Self::check_permission(&env, &caller, AdminRole::AssetManager);
+        let mut status = Self::load_asset_health(&env, &asset_code);
+        if !status.active {
+            panic!("cannot unpause a deregistered asset");
+        }
+        status.paused = false;
+        status.timestamp = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+        env.events()
+            .publish((symbol_short!("asset_unp"), asset_code), true);
+    }
+
+    /// Permanently deregister an asset while retaining historical data.
+    ///
+    /// `caller` must be the contract admin, a `SuperAdmin`, or an
+    /// `AssetManager`.
+    pub fn deregister_asset(env: Env, caller: Address, asset_code: String) {
+        Self::check_permission(&env, &caller, AdminRole::AssetManager);
+        let mut status = Self::load_asset_health(&env, &asset_code);
+        status.active = false;
+        status.paused = false;
+        status.timestamp = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetHealth(asset_code.clone()), &status);
+        env.events()
+            .publish((symbol_short!("asset_del"), asset_code), false);
     }
 
     /// Get all monitored assets
     pub fn get_monitored_assets(env: Env) -> Vec<String> {
-        env.storage()
+        let assets: Vec<String> = env.storage()
             .instance()
             .get(&DataKey::MonitoredAssets)
-            .unwrap()
+            .unwrap();
+
+        let mut active_assets = Vec::new(&env);
+        for asset_code in assets.iter() {
+            let status: Option<AssetHealth> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AssetHealth(asset_code.clone()));
+
+            match status {
+                Some(record) => {
+                    if record.active && !record.paused {
+                        active_assets.push_back(asset_code);
+                    }
+                }
+                None => active_assets.push_back(asset_code),
+            }
+        }
+
+        active_assets
     }
 
     // -----------------------------------------------------------------------
@@ -887,6 +1000,21 @@ impl BridgeWatchContract {
             || *asset_pair == String::from_str(env, "FOBXX/USDC")
     }
 
+    fn load_asset_health(env: &Env, asset_code: &String) -> AssetHealth {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetHealth(asset_code.clone()))
+            .unwrap_or_else(|| panic!("asset is not registered"))
+    }
+
+    fn assert_asset_accepting_submissions(record: &AssetHealth) {
+        if !record.active {
+            panic!("asset is deregistered");
+        }
+        if record.paused {
+            panic!("asset monitoring is paused");
+        }
+    }
     // -----------------------------------------------------------------------
     // Liquidity Pool Monitor
     // -----------------------------------------------------------------------
@@ -1029,6 +1157,7 @@ mod tests {
         let source = String::from_str(&env, "Stellar DEX");
 
         // Store reference price of 1_000_000 (1 %)
+        client.register_asset(&admin, &asset);
         client.submit_price(&admin, &asset, &1_000_000, &source);
 
         // 1 % deviation is below the default Low threshold of 2 %
@@ -1043,6 +1172,7 @@ mod tests {
         let asset = String::from_str(&env, "USDC");
         let source = String::from_str(&env, "Stellar DEX");
 
+        client.register_asset(&admin, &asset);
         client.submit_price(&admin, &asset, &1_000_000, &source);
 
         // 3 % deviation → Low severity
@@ -1060,6 +1190,7 @@ mod tests {
         let asset = String::from_str(&env, "USDC");
         let source = String::from_str(&env, "Stellar DEX");
 
+        client.register_asset(&admin, &asset);
         client.submit_price(&admin, &asset, &1_000_000, &source);
 
         // 7 % deviation → Medium severity
@@ -1077,6 +1208,7 @@ mod tests {
         let asset = String::from_str(&env, "USDC");
         let source = String::from_str(&env, "Stellar DEX");
 
+        client.register_asset(&admin, &asset);
         client.submit_price(&admin, &asset, &1_000_000, &source);
 
         // 15 % deviation → High severity
@@ -1094,6 +1226,7 @@ mod tests {
         let asset = String::from_str(&env, "USDC");
         let source = String::from_str(&env, "Stellar DEX");
 
+        client.register_asset(&admin, &asset);
         client.submit_price(&admin, &asset, &1_000_000, &source);
         client.check_price_deviation(&asset, &1_150_000);
 
@@ -1111,6 +1244,7 @@ mod tests {
 
         // Custom tight thresholds: Low > 50 bps (0.5 %)
         client.set_deviation_threshold(&asset, &50, &100, &200);
+        client.register_asset(&admin, &asset);
         client.submit_price(&admin, &asset, &1_000_000, &source);
 
         // 1 % deviation (100 bps) exceeds custom Low threshold of 50 bps
@@ -1262,6 +1396,10 @@ mod tests {
 
         let assets = client.get_monitored_assets();
         assert_eq!(assets.len(), 1);
+
+        let health = client.get_health(&usdc).unwrap();
+        assert!(health.active);
+        assert!(!health.paused);
     }
 
     #[test]
@@ -1275,6 +1413,7 @@ mod tests {
         client.initialize(&admin);
 
         let usdc = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &usdc);
         client.submit_health(&admin, &usdc, &85, &90, &80, &85);
 
         let health = client.get_health(&usdc);
@@ -1292,6 +1431,9 @@ mod tests {
         env.ledger().set_timestamp(1_000_000);
 
         let assets = ["USDC", "EURC", "PYUSD"];
+        for code in assets.iter() {
+            client.register_asset(&admin, &String::from_str(&env, code));
+        }
         let mut batch = Vec::new(&env);
         for (i, code) in assets.iter().enumerate() {
             batch.push_back(HealthScoreBatch {
@@ -1316,6 +1458,9 @@ mod tests {
     fn test_submit_health_batch_consistent_timestamps() {
         let (env, client, admin) = setup();
         env.ledger().set_timestamp(5_000_000);
+
+        client.register_asset(&admin, &String::from_str(&env, "USDC"));
+        client.register_asset(&admin, &String::from_str(&env, "EURC"));
 
         let mut batch = Vec::new(&env);
         batch.push_back(HealthScoreBatch {
@@ -1509,6 +1654,7 @@ mod tests {
         client.grant_role(&admin, &submitter, &AdminRole::HealthSubmitter);
 
         let usdc = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &usdc);
         client.submit_health(&submitter, &usdc, &80, &80, &80, &80);
 
         let health = client.get_health(&usdc).unwrap();
@@ -1573,6 +1719,85 @@ mod tests {
         assert_eq!(client.get_monitored_assets().len(), 1);
         assert!(client.get_health(&usdc).is_some());
         assert!(client.get_price(&usdc).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Asset lifecycle management tests (issue #44)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pause_asset_filters_from_monitored_assets() {
+        let (env, client, admin) = setup();
+        let usdc = String::from_str(&env, "USDC");
+
+        client.register_asset(&admin, &usdc);
+        client.pause_asset(&admin, &usdc);
+
+        let health = client.get_health(&usdc).unwrap();
+        assert!(health.paused);
+        assert!(health.active);
+        assert_eq!(client.get_monitored_assets().len(), 0);
+    }
+
+    #[test]
+    fn test_unpause_asset_restores_monitoring() {
+        let (env, client, admin) = setup();
+        let usdc = String::from_str(&env, "USDC");
+
+        client.register_asset(&admin, &usdc);
+        client.pause_asset(&admin, &usdc);
+        client.unpause_asset(&admin, &usdc);
+
+        let health = client.get_health(&usdc).unwrap();
+        assert!(!health.paused);
+        assert!(health.active);
+        assert_eq!(client.get_monitored_assets().len(), 1);
+    }
+
+    #[test]
+    fn test_deregister_asset_keeps_history_but_hides_asset() {
+        let (env, client, admin) = setup();
+        let usdc = String::from_str(&env, "USDC");
+
+        client.register_asset(&admin, &usdc);
+        client.submit_health(&admin, &usdc, &91, &88, &87, &89);
+        client.deregister_asset(&admin, &usdc);
+
+        let health = client.get_health(&usdc).unwrap();
+        assert_eq!(health.health_score, 91);
+        assert!(!health.active);
+        assert!(!health.paused);
+        assert_eq!(client.get_monitored_assets().len(), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_health_rejected_for_paused_asset() {
+        let (env, client, admin) = setup();
+        let usdc = String::from_str(&env, "USDC");
+
+        client.register_asset(&admin, &usdc);
+        client.pause_asset(&admin, &usdc);
+        client.submit_health(&admin, &usdc, &80, &80, &80, &80);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_price_rejected_for_deregistered_asset() {
+        let (env, client, admin) = setup();
+        let usdc = String::from_str(&env, "USDC");
+
+        client.register_asset(&admin, &usdc);
+        client.deregister_asset(&admin, &usdc);
+        client.submit_price(&admin, &usdc, &1_000_000, &String::from_str(&env, "DEX"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_health_rejected_for_unregistered_asset() {
+        let (env, client, admin) = setup();
+        let usdc = String::from_str(&env, "USDC");
+        client.submit_health(&admin, &usdc, &80, &80, &80, &80);
     }
 
     // -----------------------------------------------------------------------
