@@ -4,6 +4,7 @@ import Dashboard from "./pages/Dashboard";
 import AssetDetail from "./pages/AssetDetail";
 import Bridges from "./pages/Bridges";
 import Analytics from "./pages/Analytics";
+import Transactions from "./pages/Transactions";
 
 function App() {
   return (
@@ -13,6 +14,7 @@ function App() {
         <Route path="/assets/:symbol" element={<AssetDetail />} />
         <Route path="/bridges" element={<Bridges />} />
         <Route path="/analytics" element={<Analytics />} />
+        <Route path="/transactions" element={<Transactions />} />
       </Route>
     </Routes>
   );
