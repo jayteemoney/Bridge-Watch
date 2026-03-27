@@ -1,0 +1,84 @@
+name: Dependency Updates
+
+on:
+  schedule:
+    # Run weekly on Monday at 9 AM UTC
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  npm-update:
+    name: Update NPM Dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Update backend dependencies
+        working-directory: backend
+        run: |
+          npm update
+          npm audit fix --audit-level=moderate || true
+
+      - name: Update frontend dependencies
+        working-directory: frontend
+        run: |
+          npm update
+          npm audit fix --audit-level=moderate || true
+        continue-on-error: true
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update npm dependencies"
+          title: "chore: weekly npm dependency updates"
+          body: |
+            Automated dependency updates for NPM packages.
+
+            Please review the changes and ensure all tests pass before merging.
+          branch: chore/npm-dependency-updates
+          delete-branch: true
+          labels: dependencies, automated
+
+  cargo-update:
+    name: Update Cargo Dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Update Cargo dependencies
+        working-directory: contracts
+        run: cargo update
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update cargo dependencies"
+          title: "chore: weekly cargo dependency updates"
+          body: |
+            Automated dependency updates for Rust packages.
+
+            Please review the changes and ensure all tests pass before merging.
+          branch: chore/cargo-dependency-updates
+          delete-branch: true
+          labels: dependencies, automated
